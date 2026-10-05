@@ -6,7 +6,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 const server = new McpServer({
     name: "context-pruner-mcp",
-    version: "0.1.0",
+    version: "0.1.1",
 });
 function pruneCodeToSkeleton(code) {
     const lines = code.split("\n");
@@ -72,11 +72,12 @@ server.tool("get_code_skeleton", "Fetches an AST-pruned skeleton (signatures, in
         };
     }
     catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         return {
             content: [
                 {
                     type: "text",
-                    text: `Error reading file \({filePath}:\){err.message}`,
+                    text: `Error reading file ${filePath}: ${message}`,
                 },
             ],
             isError: true,
