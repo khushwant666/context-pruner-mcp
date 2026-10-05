@@ -4,11 +4,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { createPruningTotals, formatPruningStats, recordPrunedFile } from "./pruning-stats.js";
 
 const server = new McpServer({
   name: "context-pruner-mcp",
   version: "0.1.1",
 });
+
+const pruningTotals = createPruningTotals();
 
 function pruneCodeToSkeleton(code: string): string {
   const lines = code.split("\n");
@@ -78,6 +81,7 @@ server.tool(
       const resolvedPath = path.resolve(process.cwd(), filePath);
       const rawContent = await fs.readFile(resolvedPath, "utf-8");
       const pruned = pruneCodeToSkeleton(rawContent);
+      recordPrunedFile(pruningTotals, rawContent.length, pruned.length);
 
       return {
         content: [
@@ -99,6 +103,22 @@ server.tool(
         isError: true,
       };
     }
+  }
+);
+
+server.tool(
+  "get_pruning_stats",
+  "Returns the number of files processed, estimated tokens saved, and cost efficiency for this server session.",
+  {},
+  async () => {
+    return {
+      content: [
+        {
+          type: "text",
+          text: formatPruningStats(pruningTotals),
+        },
+      ],
+    };
   }
 );
 
