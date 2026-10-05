@@ -4,83 +4,42 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { normalizeSymbol, pruneCodeToSkeleton } from "./prune.js";
 import { createPruningTotals, formatPruningStats, recordPrunedFile } from "./pruning-stats.js";
 
 const server = new McpServer({
   name: "context-pruner-mcp",
-  version: "0.1.1",
+  version: "0.1.3",
 });
 
 const pruningTotals = createPruningTotals();
 
-function pruneCodeToSkeleton(code: string): string {
-  const lines = code.split("\n");
-  const skeletonLines: string[] = [];
-  let bracketDepth = 0;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (
-      trimmed.startsWith("import ") ||
-      trimmed.startsWith("export interface") ||
-      trimmed.startsWith("interface ") ||
-      trimmed.startsWith("type ") ||
-      trimmed.startsWith("export type") ||
-      trimmed.startsWith("//") ||
-      trimmed.startsWith("/*") ||
-      trimmed.startsWith("*")
-    ) {
-      skeletonLines.push(line);
-      continue;
-    }
-
-    if (trimmed.includes("class ") && trimmed.endsWith("{")) {
-      skeletonLines.push(line);
-      bracketDepth++;
-      continue;
-    }
-
-    const isFunctionOrMethod =
-      (trimmed.startsWith("public ") ||
-        trimmed.startsWith("private ") ||
-        trimmed.startsWith("async ") ||
-        trimmed.startsWith("function ") ||
-        trimmed.startsWith("export function ") ||
-        trimmed.includes("):") ||
-        trimmed.includes(") :") ||
-        trimmed.includes("=> {")) &&
-      trimmed.includes("(");
-
-    if (isFunctionOrMethod) {
-      if (line.includes("{")) {
-        skeletonLines.push(line.replace(/\{.*/, "{ /* implementation hidden */ }"));
-      } else {
-        skeletonLines.push(line);
-      }
-      continue;
-    }
-
-    if (trimmed === "}" && bracketDepth > 0) {
-      bracketDepth--;
-      skeletonLines.push(line);
-    }
-  }
-
-  return skeletonLines.join("\n");
-}
-
 server.tool(
   "get_code_skeleton",
-  "Fetches an AST-pruned skeleton (signatures, interfaces, exports) of a file, saving context tokens by removing function bodies.",
+  "Fetches a pruned skeleton of a file. Pass symbol to keep that function's full body and hide every other function body.",
   {
     filePath: z.string().describe("Relative or absolute path to the target code file"),
+    symbol: z
+      .string()
+      .optional()
+      .describe("Function or method name to keep in full, such as chargeCustomer. Omit to hide every function body."),
   },
-  async ({ filePath }) => {
+  async ({ filePath, symbol }) => {
+    let focusedSymbol: string | undefined;
+    try {
+      focusedSymbol = normalizeSymbol(symbol);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: message }],
+        isError: true,
+      };
+    }
+
     try {
       const resolvedPath = path.resolve(process.cwd(), filePath);
       const rawContent = await fs.readFile(resolvedPath, "utf-8");
-      const pruned = pruneCodeToSkeleton(rawContent);
+      const pruned = pruneCodeToSkeleton(rawContent, focusedSymbol).text;
       recordPrunedFile(pruningTotals, rawContent.length, pruned.length);
 
       return {

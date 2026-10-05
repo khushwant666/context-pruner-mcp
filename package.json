@@ -1,6 +1,6 @@
 {
   "name": "@khushwant.r/context-pruner-mcp",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "High-efficiency AST context pruner & skeleton extractor for Cursor and Claude Code MCP",
   "type": "module",
   "bin": {
@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "node --experimental-strip-types --test test/pruning-stats.test.ts",
+    "test": "node --experimental-strip-types --test test/pruning-stats.test.ts test/prune.test.ts",
     "prepare": "npm run build"
   },
   "repository": {
