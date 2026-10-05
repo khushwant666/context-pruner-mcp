@@ -72,11 +72,12 @@ Agents still fall back to native file reads unless you say otherwise. Add this t
 When reading reference files, exploring dependencies, or checking types, ALWAYS use the `get_code_skeleton` MCP tool instead of reading raw file contents. Only read the full implementation of the exact file being edited.
 ```
 
-## Tool
+## Tools
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `get_code_skeleton` | `filePath: string` | Reads a file and returns imports, interfaces, types, exported classes, and method signatures. Function bodies are replaced with `/* implementation hidden */`. `filePath` may be relative to the working directory or absolute. |
+| `get_code_skeleton` | `filePath: string` | Reads a file and returns imports, interfaces, types, exported classes, and method signatures. Function bodies are replaced with `/* implementation hidden */`. `filePath` may be relative to the working directory or absolute. Each successful call adds that file to the session totals. |
+| `get_pruning_stats` | none | Returns files processed, estimated original tokens, pruned tokens, tokens saved, and approximate USD saved for the current server session. Ask the agent: "What are the pruning stats?" |
 
 ## Example
 
