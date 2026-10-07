@@ -1,0 +1,1 @@
+export declare const HIDDEN_IMPLEMENTATION_GUIDANCE = "When reading pruned code, never invent or guess logic behind '/* implementation hidden */'. If a hidden function's logic is needed to resolve an issue, call get_code_skeleton again targeting that specific symbol.";

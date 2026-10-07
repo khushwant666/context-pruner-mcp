@@ -4,7 +4,7 @@ import {
   createPruningTotals,
   formatPruningStats,
   recordPrunedFile,
-} from "../src/pruning-stats.ts";
+} from "../dist/pruning-stats.js";
 
 describe("pruning stats", () => {
   it("reports an empty session as zero savings", () => {
