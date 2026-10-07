@@ -1,115 +1,233 @@
-const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+import ts from "typescript";
+import { collectSameFileCallees, parseSourceFile } from "./callees.js";
 
-const FUNCTION_DECLARATION =
-  /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\*?\s+([A-Za-z_$][\w$]*)\b/;
-const VARIABLE_DECLARATION =
-  /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/;
-const METHOD_DECLARATION =
-  /^(?:export\s+)?(?:(?:public|private|protected|async|static|readonly|abstract|override|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]+>)?\s*\(/;
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+const HIDDEN_BODY = "{ /* implementation hidden */ }";
+const DEFAULT_FILE_NAME = "snippet.ts";
 
 export interface PruneResult {
   text: string;
   symbolFound: boolean;
 }
 
-export function pruneCodeToSkeleton(code: string, symbol?: string): PruneResult {
-  const focusedSymbol = normalizeSymbol(symbol);
-  if (focusedSymbol === undefined) {
-    return { text: pruneWithoutSymbol(code), symbolFound: false };
+export interface PruneFocus {
+  symbols?: readonly string[];
+  expandCallees?: boolean;
+  filePath?: string;
+}
+
+interface ResolvedFocus {
+  symbols: string[];
+  expandCallees: boolean;
+  filePath?: string;
+}
+
+interface BodySpan {
+  name: string | null;
+  start: number;
+  end: number;
+}
+
+export function pruneCodeToSkeleton(code: string, symbol?: string): PruneResult;
+export function pruneCodeToSkeleton(code: string, focus: PruneFocus): PruneResult;
+export function pruneCodeToSkeleton(code: string, symbolOrFocus?: string | PruneFocus): PruneResult {
+  const focus = resolveFocus(symbolOrFocus);
+  if (focus.expandCallees && !focus.filePath) {
+    throw new Error("A file path is required to expand callees.");
   }
 
-  const lines = code.split("\n");
-  const output: string[] = [];
-  let depth = 0;
-  let mode: "scan" | "keep" | "skip" = "scan";
-  let stopDepth = 0;
-  let awaiting: "keep" | "skip" | null = null;
-  let awaitBaseDepth = 0;
-  let symbolFound = false;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    const nextDepth = depth + braceDelta(line);
-
-    if (mode === "keep") {
-      output.push(line);
-      depth = nextDepth;
-      if (depth <= stopDepth) {
-        mode = "scan";
-      }
-      continue;
+  const filePath = focus.filePath ?? DEFAULT_FILE_NAME;
+  const keepNames = new Set(focus.symbols);
+  if (focus.expandCallees && focus.filePath) {
+    for (const callee of collectSameFileCallees(code, focus.filePath, focus.symbols)) {
+      keepNames.add(callee);
     }
-
-    if (mode === "skip") {
-      depth = nextDepth;
-      if (depth <= stopDepth) {
-        mode = "scan";
-      }
-      continue;
-    }
-
-    if (awaiting) {
-      output.push(line);
-      depth = nextDepth;
-      if (nextDepth > awaitBaseDepth) {
-        mode = awaiting;
-        stopDepth = awaitBaseDepth;
-        awaiting = null;
-      } else if (trimmed.endsWith(";") && !trimmed.includes("{")) {
-        awaiting = null;
-      }
-      continue;
-    }
-
-    const declaredName = declaredFunctionName(trimmed);
-    if (declaredName !== null && opensFunction(trimmed)) {
-      const keepThisFunction = declaredName === focusedSymbol;
-      if (keepThisFunction) {
-        symbolFound = true;
-      }
-      if (nextDepth === depth && !trimmed.includes("{")) {
-        output.push(line);
-        awaiting = keepThisFunction ? "keep" : "skip";
-        awaitBaseDepth = depth;
-        continue;
-      }
-      if (keepThisFunction) {
-        output.push(line);
-        if (nextDepth > depth) {
-          mode = "keep";
-          stopDepth = depth;
-        }
-      } else if (trimmed.includes("{")) {
-        output.push(line.replace(/\{.*/, "{ /* implementation hidden */ }"));
-        if (nextDepth > depth) {
-          mode = "skip";
-          stopDepth = depth;
-        }
-      } else {
-        output.push(line);
-      }
-      depth = nextDepth;
-      continue;
-    }
-
-    if (isStructuralLine(trimmed) || (trimmed.includes("class ") && trimmed.endsWith("{"))) {
-      output.push(line);
-      depth = nextDepth;
-      continue;
-    }
-
-    if (trimmed === "}" && depth > 0) {
-      output.push(line);
-    }
-    depth = nextDepth;
   }
 
-  let text = output.join("\n");
-  if (!symbolFound) {
-    const note = `// Symbol "${focusedSymbol}" was not found. Returned a skeleton only.`;
+  return hideUnkeptBodies(code, filePath, keepNames, focus.symbols);
+}
+
+function hideUnkeptBodies(
+  code: string,
+  filePath: string,
+  keepNames: ReadonlySet<string>,
+  requested: readonly string[],
+): PruneResult {
+  const sourceFile = parseSourceFile(code, filePath);
+  const foundNames = new Set<string>();
+  const replacements: BodySpan[] = [];
+
+  const visit = (node: ts.Node, insideKept: boolean): void => {
+    const body = namedBlock(node, sourceFile);
+    if (!body) {
+      ts.forEachChild(node, (child) => visit(child, insideKept));
+      return;
+    }
+
+    const keep = body.name !== null && keepNames.has(body.name);
+    if (keep && body.name !== null && requested.includes(body.name)) {
+      foundNames.add(body.name);
+    }
+    if (!keep && !insideKept) {
+      replacements.push(body);
+      return;
+    }
+    ts.forEachChild(node, (child) => visit(child, insideKept || keep));
+  };
+
+  visit(sourceFile, false);
+  const spans = omitNestedSpans(replacements);
+  spans.sort((left, right) => right.start - left.start);
+
+  let text = code;
+  for (const span of spans) {
+    text = text.slice(0, span.start) + HIDDEN_BODY + text.slice(span.end);
+  }
+
+  const missing = requested.filter((name) => !foundNames.has(name));
+  if (missing.length > 0) {
+    const note = missingSymbolNote(missing, requested.length);
     text = text.length > 0 ? `${text}\n${note}` : note;
   }
-  return { text, symbolFound };
+  return { text, symbolFound: foundNames.size > 0 };
+}
+
+function omitNestedSpans(spans: readonly BodySpan[]): BodySpan[] {
+  return spans.filter((span, index) => {
+    const nested = spans.some((other) => isStrictlyInside(span, other));
+    if (nested) {
+      return false;
+    }
+    const firstWithRange = spans.findIndex((other) => other.start === span.start && other.end === span.end);
+    return firstWithRange === index;
+  });
+}
+
+function isStrictlyInside(inner: BodySpan, outer: BodySpan): boolean {
+  const contained = outer.start <= inner.start && inner.end <= outer.end;
+  const smaller = outer.start < inner.start || outer.end > inner.end;
+  return contained && smaller;
+}
+
+function namedBlock(node: ts.Node, sourceFile: ts.SourceFile): BodySpan | undefined {
+  const block = blockBody(node);
+  if (!block) {
+    return undefined;
+  }
+  return {
+    name: functionName(node),
+    start: block.getStart(sourceFile),
+    end: block.end,
+  };
+}
+
+function blockBody(node: ts.Node): ts.Node | undefined {
+  if (
+    ts.isConstructorDeclaration(node) ||
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isFunctionExpression(node)
+  ) {
+    return node.body;
+  }
+  if (ts.isVariableDeclaration(node) && node.initializer && isFunctionValue(node.initializer)) {
+    return functionValueBody(node.initializer);
+  }
+  if (ts.isArrowFunction(node)) {
+    return functionValueBody(node);
+  }
+  return undefined;
+}
+
+function isFunctionValue(node: ts.Expression): node is ts.ArrowFunction | ts.FunctionExpression {
+  return ts.isArrowFunction(node) || ts.isFunctionExpression(node);
+}
+
+function functionValueBody(fn: ts.ArrowFunction | ts.FunctionExpression): ts.Node {
+  if (ts.isArrowFunction(fn) && !ts.isBlock(fn.body)) {
+    return fn.body;
+  }
+  return fn.body;
+}
+
+function functionName(node: ts.Node): string | null {
+  if (ts.isConstructorDeclaration(node)) {
+    return "constructor";
+  }
+  if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isFunctionExpression(node)) {
+    return identifierText(node.name);
+  }
+  if (ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) {
+    return identifierText(node.name);
+  }
+  if (ts.isVariableDeclaration(node)) {
+    return identifierText(node.name);
+  }
+  return null;
+}
+
+function identifierText(name: ts.Node | undefined): string | null {
+  if (name && ts.isIdentifier(name)) {
+    return name.text;
+  }
+  return null;
+}
+
+function resolveFocus(symbolOrFocus?: string | PruneFocus): ResolvedFocus {
+  if (typeof symbolOrFocus === "string" || symbolOrFocus === undefined) {
+    const symbol = normalizeSymbol(symbolOrFocus);
+    return { symbols: symbol ? [symbol] : [], expandCallees: false };
+  }
+  const symbols = (symbolOrFocus.symbols ?? []).map((name) => {
+    const normalized = normalizeSymbol(name);
+    if (!normalized) {
+      throw new Error("Symbol names cannot be empty.");
+    }
+    return normalized;
+  });
+  return {
+    symbols,
+    expandCallees: symbolOrFocus.expandCallees === true,
+    filePath: symbolOrFocus.filePath,
+  };
+}
+
+function missingSymbolNote(missing: readonly string[], requestedCount: number): string {
+  if (missing.length === 1 && requestedCount === 1) {
+    return `// Symbol "${missing[0]}" was not found. Returned a skeleton only.`;
+  }
+  const quoted = missing.map((name) => `"${name}"`).join(", ");
+  const suffix = missing.length === requestedCount ? " Returned a skeleton only." : "";
+  return `// ${missing.length === 1 ? "Symbol" : "Symbols"} ${quoted} ${missing.length === 1 ? "was" : "were"} not found.${suffix}`;
+}
+
+export function normalizeSymbolList(
+  symbol: string | undefined,
+  symbols: string | readonly string[] | undefined,
+): string[] {
+  const rawNames: string[] = [];
+  if (symbol !== undefined) {
+    rawNames.push(symbol);
+  }
+  if (typeof symbols === "string") {
+    rawNames.push(symbols);
+  } else if (symbols) {
+    rawNames.push(...symbols);
+  }
+
+  const unique: string[] = [];
+  for (const name of rawNames) {
+    const normalized = normalizeSymbol(name);
+    if (!normalized) {
+      throw new Error("Symbol names cannot be empty.");
+    }
+    if (!unique.includes(normalized)) {
+      unique.push(normalized);
+    }
+  }
+  return unique;
 }
 
 export function normalizeSymbol(symbol: string | undefined): string | undefined {
@@ -123,123 +241,4 @@ export function normalizeSymbol(symbol: string | undefined): string | undefined 
     );
   }
   return trimmed;
-}
-
-function pruneWithoutSymbol(code: string): string {
-  const lines = code.split("\n");
-  const skeletonLines: string[] = [];
-  let bracketDepth = 0;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (isStructuralLine(trimmed)) {
-      skeletonLines.push(line);
-      continue;
-    }
-
-    if (trimmed.includes("class ") && trimmed.endsWith("{")) {
-      skeletonLines.push(line);
-      bracketDepth++;
-      continue;
-    }
-
-    const isFunctionOrMethod =
-      (trimmed.startsWith("public ") ||
-        trimmed.startsWith("private ") ||
-        trimmed.startsWith("async ") ||
-        trimmed.startsWith("function ") ||
-        trimmed.startsWith("export function ") ||
-        trimmed.includes("):") ||
-        trimmed.includes(") :") ||
-        trimmed.includes("=> {")) &&
-      trimmed.includes("(");
-
-    if (isFunctionOrMethod) {
-      if (line.includes("{")) {
-        skeletonLines.push(line.replace(/\{.*/, "{ /* implementation hidden */ }"));
-      } else {
-        skeletonLines.push(line);
-      }
-      continue;
-    }
-
-    if (trimmed === "}" && bracketDepth > 0) {
-      bracketDepth--;
-      skeletonLines.push(line);
-    }
-  }
-
-  return skeletonLines.join("\n");
-}
-
-function isStructuralLine(trimmed: string): boolean {
-  return (
-    trimmed.startsWith("import ") ||
-    trimmed.startsWith("export interface") ||
-    trimmed.startsWith("interface ") ||
-    trimmed.startsWith("type ") ||
-    trimmed.startsWith("export type") ||
-    trimmed.startsWith("//") ||
-    trimmed.startsWith("/*") ||
-    trimmed.startsWith("*")
-  );
-}
-
-function declaredFunctionName(trimmed: string): string | null {
-  return (
-    FUNCTION_DECLARATION.exec(trimmed)?.[1] ??
-    VARIABLE_DECLARATION.exec(trimmed)?.[1] ??
-    METHOD_DECLARATION.exec(trimmed)?.[1] ??
-    null
-  );
-}
-
-function opensFunction(trimmed: string): boolean {
-  return (
-    trimmed.includes("function") ||
-    trimmed.includes("=>") ||
-    trimmed.includes("{") ||
-    trimmed.endsWith("(") ||
-    trimmed.endsWith(",") ||
-    trimmed.includes("(")
-  );
-}
-
-function braceDelta(line: string): number {
-  let delta = 0;
-  let quote: "'" | '"' | "`" | null = null;
-  let escaped = false;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (quote) {
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (character === "\\") {
-        escaped = true;
-        continue;
-      }
-      if (character === quote) {
-        quote = null;
-      }
-      continue;
-    }
-    if (character === "/" && line[index + 1] === "/") {
-      break;
-    }
-    if (character === "'" || character === '"' || character === "`") {
-      quote = character;
-      continue;
-    }
-    if (character === "{") {
-      delta += 1;
-    } else if (character === "}") {
-      delta -= 1;
-    }
-  }
-
-  return delta;
 }
